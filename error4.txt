@@ -1,0 +1,2 @@
+/home/e/e1350606/postagger/HMMPosTagger/./submission.py:157: RuntimeWarning: divide by zero encountered in log
+  dp[i,0] = np.log(self.init_prob[y]) + np.log(emit_p + 1e-12)
