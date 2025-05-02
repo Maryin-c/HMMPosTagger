@@ -4,6 +4,188 @@ from itertools import product
 import warnings
 import time
 
+class HMMPOSTagger_multi_lambda_feat:
+    def __init__(self,
+                 lambda_interp=0.5,
+                 lambda_emit=1.0,
+                 use_case=True,
+                 use_digit=True,
+                 use_hyphen=True,
+                 use_suffix=True):
+        """
+        Args:
+          lambda_interp: 插值平滑系数 α
+          lambda_emit:   发射概率 Add-λ 参数
+          use_case:      是否使用首字母大写特征
+          use_digit:     是否使用数字特征
+          use_hyphen:    是否使用连字符特征
+          use_suffix:    是否使用后缀特征（2-4 字符长度）
+        """
+        # HMM 参数
+        self.states = []
+        self.observations = []
+        self.init_prob = {}
+        self.trans_prob = {}
+        self.emit_prob = {}
+
+        # 平滑参数
+        self.lambda_interp = lambda_interp
+        self.lambda_emit = lambda_emit
+
+        # 特征开关
+        self.use_case = use_case
+        self.use_digit = use_digit
+        self.use_hyphen = use_hyphen
+        self.use_suffix = use_suffix
+
+        # 存储 feature counts/tag
+        self.feature_counts = defaultdict(Counter)
+        self.feature_probs  = defaultdict(dict)
+
+        # 存储 unigram tag 概率，用于转移插值
+        self.tag_unigram = {}
+
+    def _extract_features(self, word):
+        """针对一个词，输出其所有激活的特征名称列表"""
+        feats = []
+        if self.use_case and word and word[0].isupper():
+            feats.append("feat_is_cap")
+        if self.use_digit and any(ch.isdigit() for ch in word):
+            feats.append("feat_has_digit")
+        if self.use_hyphen and "-" in word:
+            feats.append("feat_has_hyphen")
+        if self.use_suffix and len(word) >= 2:
+            # 2 到 4 长度的后缀
+            L = len(word)
+            for l in (2,3,4):
+                if L >= l:
+                    suffix = word[-l:]
+                    feats.append(f"feat_suf_{suffix.lower()}")
+        return feats
+
+    def train(self, tagged_sentences):
+        # 计数
+        tag_counts   = Counter()
+        word_tag_cnt = defaultdict(Counter)
+        trans_cnt    = defaultdict(Counter)
+        init_cnt     = Counter()
+
+        # 1. 收集计数
+        for sent in tagged_sentences:
+            prev_tag = None
+            for idx, (word, tag) in enumerate(sent):
+                tag_counts[tag] += 1
+                word_tag_cnt[tag][word] += 1
+
+                # 初始
+                if idx == 0:
+                    init_cnt[tag] += 1
+                else:
+                    trans_cnt[prev_tag][tag] += 1
+                prev_tag = tag
+
+                # 特征计数
+                feats = self._extract_features(word)
+                for f in feats:
+                    self.feature_counts[tag][f] += 1
+
+        # 列表化
+        self.states       = list(tag_counts.keys())
+        self.observations = list({w for cnt in word_tag_cnt.values() for w in cnt})
+
+        V_tag  = len(self.states)
+        V_obs  = len(self.observations)
+        total_tags = sum(tag_counts.values())
+
+        # 2. 初始概率（Add-λ）
+        total_init = sum(init_cnt.values()) + self.lambda_emit * V_tag
+        for y in self.states:
+            self.init_prob[y] = (init_cnt[y] + self.lambda_emit) / total_init
+
+        # 3. 发射概率 P(w|y)（Add-λ）
+        self.emit_prob = {}
+        for y in self.states:
+            denom = tag_counts[y] + self.lambda_emit * V_obs
+            self.emit_prob[y] = {
+                w: (word_tag_cnt[y][w] + self.lambda_emit) / denom
+                for w in self.observations
+            }
+
+        # 4. 转移概率 P(y'|y)（插值平滑）
+        #    先算 unigram + bigram MLE
+        self.tag_unigram = {y: tag_counts[y]/total_tags for y in self.states}
+        mle_bigram = {
+            y: {y2: trans_cnt[y][y2]/tag_counts[y] if tag_counts[y]>0 else 0.0
+                for y2 in self.states}
+            for y in self.states
+        }
+        self.trans_prob = {}
+        for y in self.states:
+            self.trans_prob[y] = {
+                y2: self.lambda_interp * mle_bigram[y][y2]
+                    + (1-self.lambda_interp) * self.tag_unigram[y2]
+                for y2 in self.states
+            }
+
+        # 5. 特征概率 P(f|y) = count(f,y)/C(y)
+        self.feature_probs = {}
+        for y in self.states:
+            total_feat = sum(self.feature_counts[y].values())
+            # 如果没有特征计数防止 0 分母
+            denom = total_feat if total_feat>0 else 1
+            self.feature_probs[y] = {
+                f: self.feature_counts[y][f] / denom
+                for f in self.feature_counts[y]
+            }
+
+    def viterbi_decode(self, sentence):
+        words = sentence
+        T = len(words)
+        N = len(self.states)
+
+        dp = np.full((N, T), -np.inf)
+        bp = np.zeros((N, T), dtype=int)
+
+        # t=0
+        for i, y in enumerate(self.states):
+            emit_p = self.emit_prob[y].get(words[0], None)
+            if emit_p is None:
+                # 未登录词：用特征概率平均
+                feats = self._extract_features(words[0])
+                emit_p = np.mean([self.feature_probs[y].get(f, 0.0) for f in feats]) \
+                         if feats else 1e-12
+            dp[i,0] = np.log(self.init_prob[y]) + np.log(emit_p + 1e-12)
+
+        # t > 0
+        for t in range(1, T):
+            w = words[t]
+            feats = None  # 延后提取
+            for i, y in enumerate(self.states):
+                # emission
+                emit_p = self.emit_prob[y].get(w, None)
+                if emit_p is None:
+                    if feats is None:
+                        feats = self._extract_features(w)
+                    emit_p = np.mean([self.feature_probs[y].get(f, 0.0) for f in feats]) \
+                             if feats else 1e-12
+
+                log_emit = np.log(emit_p + 1e-12)
+                # best previous
+                scores = [dp[j,t-1] + np.log(self.trans_prob[self.states[j]][y] + 1e-12)
+                          for j in range(N)]
+                best_j = int(np.argmax(scores))
+                dp[i,t] = scores[best_j] + log_emit
+                bp[i,t] = best_j
+
+        # 终止 & 回溯
+        last = int(np.argmax(dp[:,T-1]))
+        tags_idx = [last]
+        for t in range(T-1, 0, -1):
+            last = bp[last,t]
+            tags_idx.append(last)
+        tags_idx.reverse()
+        return [self.states[i] for i in tags_idx]
+
 class HMMPOSTagger_multi_lambda_morph:
     def __init__(self,
                  lambda_interp=0.5,
@@ -843,37 +1025,95 @@ def cross_validate_trigram(train_data, valid_data,
     print(f"\n>> Best params: λ_trans = {best_params[0]}, λ_emit = {best_params[1]}  (acc = {best_acc:.4f})")
     return best_params
 
-# def cross_validate_multi_lambda_morphology(train_data, valid_data, 
-#                          lambda_interp_candidates=[0.1, 0.2, 0.3, 0.4, 0.5, 0.8, 1],
-#                          lambda_emit_candidates=[0, 0.001, 0.01, 0.1, 0.5, 1]):
-#     """交叉验证选择最佳 lambda_interp 和 lambda_emit"""
-#     best_params = (0.5, 1.0)
-#     best_accuracy = 0
-    
-#     results = []
-#     # 遍历所有参数组合
-#     for lambda_interp, lambda_emit in product(lambda_interp_candidates, lambda_emit_candidates):
-#         model = HMMPOSTagger_multi_lambda_morph(lambda_interp=lambda_interp, lambda_emit=lambda_emit)
-#         model.train(train_data)
-#         accuracy = evaluate(model, valid_data)  # 需实现评估函数
-#         results.append({
-#                 "lambda_interp": lambda_interp,
-#                 "lambda_emit": lambda_emit,
-#                 "accuracy": accuracy # 保留4位小数
-#             })
-#         print(results[len(results) - 1])
-#         if accuracy > best_accuracy:
-#             best_accuracy = accuracy
-#             best_params = (lambda_interp, lambda_emit)
-    
-#     sorted_results = sorted(results, key=lambda x: -x["accuracy"])
-#     # 打印排序结果
-#     print("\n===== 交叉验证结果排序 =====")
-#     print("Rank | λ_interp | λ_emit | Accuracy")
-#     for idx, res in enumerate(sorted_results, 1):
-#         print(f"{idx} | {res['lambda_interp']} | {res['lambda_emit']} | {res['accuracy']}")
+def cross_validate_multi_lambda_feat(train_data, valid_data, 
+                         lambda_interp_candidates=[0.1, 0.2, 0.3, 0.4, 0.5, 0.8, 1],
+                         lambda_emit_candidates=[0, 0.001, 0.01, 0.1, 0.5, 1]):
+    flag_names = [
+        "use_case",
+        "use_digit",
+        "use_hyphen",
+        "use_suffix",
+    ]
 
-#     return best_params
+    # 预计算总实验次数
+    num_flags = 2 ** len(flag_names)
+    num_interps = len(lambda_interp_candidates)
+    num_emits = len(lambda_emit_candidates)
+    total_jobs = num_flags * num_interps * num_emits
+
+    start_time = time.time()
+    job_count = 0
+
+    best_params = None
+    best_valid_acc = 0.0
+    all_results = []
+
+    # 生成所有布尔特征组合
+    flag_values = list(product([False, True], repeat=len(flag_names)))
+
+    for lambda_interp, lambda_emit in product(lambda_interp_candidates, lambda_emit_candidates):
+        for flags in flag_values:
+            job_count += 1
+
+            # 构造模型参数字典
+            params = {
+                "lambda_interp": lambda_interp,
+                "lambda_emit": lambda_emit
+            }
+            params.update({name: flag for name, flag in zip(flag_names, flags)})
+
+            # 训练
+            model = HMMPOSTagger_multi_lambda_feat(**params)
+            model.train(train_data)
+
+            # 评估训练和验证准确率
+            # train_acc = evaluate(model, train_data)
+            valid_acc = evaluate(model, valid_data)
+
+            # 保存结果
+            row = dict(params)
+            # row["train_accuracy"] = round(train_acc, 4)
+            row["valid_accuracy"] = valid_acc
+            all_results.append(row)
+
+            # 计算 ETA
+            elapsed = time.time() - start_time
+            avg_time = elapsed / job_count
+            remaining = avg_time * (total_jobs - job_count)
+
+            # 实时打印并立即 flush
+            print(
+                f"[{job_count}/{total_jobs}] "
+                + f"interp={lambda_interp}, emit={lambda_emit}, "
+                + ", ".join(f"{name}={flag}" for name, flag in zip(flag_names, flags))
+                + f" → valid_acc={row['valid_accuracy']} | ETA: {remaining:.1f}s",
+                flush=True
+            )
+
+            # 更新最优（基于验证集）
+            if valid_acc > best_valid_acc:
+                best_valid_acc = valid_acc
+                best_params = row.copy()
+
+    # 按验证集准确率降序排序
+    sorted_results = sorted(all_results, key=lambda x: -x["valid_accuracy"])
+
+    # 打印汇总排名，并立即 flush
+    print("\n===== 交叉验证结果排序（按验证集准确率） =====", flush=True)
+    header = ["Rank", "λ_interp", "λ_emit"] + flag_names + ["Valid_Acc"]
+    print(" | ".join(header), flush=True)
+    print("-" * (len(header) * 12), flush=True)
+    for idx, res in enumerate(sorted_results, 1):
+        vals = [
+            str(idx),
+            str(res["lambda_interp"]),
+            str(res["lambda_emit"])
+        ]
+        vals += [str(res[name]) for name in flag_names]
+        vals += [f"{res['valid_accuracy']}"]
+        print(" | ".join(vals), flush=True)
+
+    return best_params, sorted_results
 
 def cross_validate_multi_lambda_morphology(
     train_data,
@@ -989,7 +1229,8 @@ def train_and_test(entrain, endev, entest):
     # print(f"interp, best lambda: {cross_validate_interp(train_data, valid_data)}")
     # print(f"multi, best lambda: {cross_validate_multi_lambda(train_data, valid_data)}")
     # print(f"multi, best lambda: {cross_validate_trigram(train_data, valid_data)}")
-    print(f"multi morphology, best lambda: {cross_validate_multi_lambda_morphology(train_data, valid_data)}", flush=True)
+    print(f"multi morphology, best lambda: {cross_validate_multi_lambda_feat(train_data, valid_data)}", flush=True)
+    # print(f"multi morphology, best lambda: {cross_validate_multi_lambda_morphology(train_data, valid_data)}", flush=True)
     
     # # 初始化并训练模型
     # tagger = HMMPOSTagger()
